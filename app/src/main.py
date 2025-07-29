@@ -1,78 +1,61 @@
-from fastapi import FastAPI
-import joblib
+from pathlib import Path
+
 import pandas as pd
-from datetime import datetime, timedelta
+from fastapi import FastAPI
 
 app = FastAPI()
 
-# Load your pre‑trained model
-model = joblib.load("fraud_model.pkl")
+# Paths
+HERE = Path(__file__).resolve().parent  # app/src
+PROJECT_ROOT = HERE.parent  # app
+DATA_CSV = PROJECT_ROOT / "data" / "transactional-sample.csv"
 
-# Example in‑memory store of recent transactions for velocity calculation
-# In prod you’d use a time‑series database or cache (Redis, etc.)
-RECENT_TXNS = []
+# Load and preprocess
+df_all = pd.read_csv(DATA_CSV)
+df_all["transaction_date"] = pd.to_datetime(df_all["transaction_date"])
 
-def compute_velocity(txn: dict, window_minutes: int = 10) -> int:
-    """
-    Count how many transactions from this user_id occurred in the past `window_minutes`.
-    For demo, uses RECENT_TXNS list of (timestamp, user_id).
-    """
-    now = datetime.fromisoformat(txn["transaction_time"])
-    # Purge old entries
-    cutoff = now - timedelta(minutes=window_minutes)
-    global RECENT_TXNS
-    RECENT_TXNS = [(ts, uid) for ts, uid in RECENT_TXNS if ts >= cutoff]
-    # Count recent by same user
-    count = sum(1 for ts, uid in RECENT_TXNS if uid == txn["user_id"])
-    # Add current txn to store
-    RECENT_TXNS.append((now, txn["user_id"]))
-    return count
 
-def compute_amount_bin(amount: float, bin_size: float = 100.0) -> str:
-    """
-    Place `amount` into a text bin, e.g. "0-100", "100-200", etc.
-    """
-    lower = (amount // bin_size) * bin_size
-    upper = lower + bin_size
-    return f"{int(lower)}-{int(upper)}"
+# Rule: more than 3 transactions by the same user in 10 minutes
+def rule_velocity(txn: dict) -> bool:
+    now = pd.to_datetime(txn["transaction_date"])
+    cutoff = now - pd.Timedelta(minutes=10)
+    mask = (
+            (df_all["user_id"] == txn["user_id"]) &
+            (df_all["transaction_date"] >= cutoff) &
+            (df_all["transaction_date"] < now)
+    )
+    return bool(mask.sum() > 3)
 
-# Example business rule: more than 3 small txns in 10 minutes
-def rule_velocity(features: pd.Series) -> bool:
-    return features["velocity_10min"] > 3
 
-rules = [rule_velocity]
+# Rule: more than 2 low-value transactions (<R$10) on same device in 10 minutes
+def rule_low_value_tests(txn: dict) -> bool:
+    now = pd.to_datetime(txn["transaction_date"])
+    cutoff = now - pd.Timedelta(minutes=10)
+    mask = (
+            (df_all["device_id"] == txn["device_id"]) &
+            (df_all["transaction_date"] >= cutoff) &
+            (df_all["transaction_date"] < now) &
+            (df_all["transaction_amount"] < 10)
+    )
+    return bool(mask.sum() > 2)
+
+
+rules = [rule_velocity, rule_low_value_tests]
+
 
 @app.post("/score")
 def score_transaction(txn: dict):
-    # 1) Feature extraction
-    features = pd.DataFrame([txn]).iloc[0]
-    features["velocity_10min"] = compute_velocity(txn)
-    features["amount_bin"]     = compute_amount_bin(txn["transaction_amount"])
+    # Normalize timestamp key
+    txn_time = txn.get("transaction_date") or txn.get("transaction_time")
+    txn = {**txn, "transaction_date": txn_time}
 
-    # 2) Rules scoring
-    rule_flags   = [int(rule(features)) for rule in rules]
-    score_rules  = sum(rule_flags) / len(rules)
+    # Evaluate rules
+    flags = {f"rule_{i + 1}": rule(txn) for i, rule in enumerate(rules)}
+    is_suspicious = any(flags.values())
 
-    # 3) ML scoring
-    df_single    = pd.DataFrame([txn])
-    score_ml     = model.predict_proba(df_single)[:, 1][0]
-
-    # 4) Combined risk score
-    risk_score   = 0.5 * score_rules + 0.5 * score_ml
-
-    # 5) Decision logic
-    if risk_score >= 0.8:
-        action = "decline"
-    elif risk_score >= 0.5:
-        action = "step_up"
-    else:
-        action = "approve"
+    action = "hold_for_review" if is_suspicious else "approve"
 
     return {
-        "risk_score": round(risk_score, 3),
-        "action":     action,
-        "features": {
-            "velocity_10min": features["velocity_10min"],
-            "amount_bin":     features["amount_bin"],
-        }
+        "action": action,
+        "rule_flags": flags
     }
