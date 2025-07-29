@@ -1,16 +1,29 @@
+from datetime import datetime, timedelta
 from fastapi import FastAPI
 import joblib
 import pandas as pd
-from datetime import datetime, timedelta
+from pathlib import Path
+
+with open(__file__, "rb") as f:
+    first = f.readline()
+print("First line bytes:", first)
+
 
 app = FastAPI()
 
-# Load your pre‑trained model
-model = joblib.load("fraud_model.pkl")
+# Determine the path to this source file:
+HERE = Path(__file__).resolve().parent
+
+# Construct the full path to fraud_model.pkl inside the same folder:
+MODEL_PATH = HERE / "fraud_model.pkl"
+
+# Load machine-learning pre‑trained model
+model = joblib.load(MODEL_PATH)
 
 # Example in‑memory store of recent transactions for velocity calculation
-# In prod you’d use a time‑series database or cache (Redis, etc.)
+# In prod use a time‑series database or cache (Redis, etc.)
 RECENT_TXNS = []
+
 
 def compute_velocity(txn: dict, window_minutes: int = 10) -> int:
     """
@@ -28,6 +41,7 @@ def compute_velocity(txn: dict, window_minutes: int = 10) -> int:
     RECENT_TXNS.append((now, txn["user_id"]))
     return count
 
+
 def compute_amount_bin(amount: float, bin_size: float = 100.0) -> str:
     """
     Place `amount` into a text bin, e.g. "0-100", "100-200", etc.
@@ -36,29 +50,32 @@ def compute_amount_bin(amount: float, bin_size: float = 100.0) -> str:
     upper = lower + bin_size
     return f"{int(lower)}-{int(upper)}"
 
+
 # Example business rule: more than 3 small txns in 10 minutes
 def rule_velocity(features: pd.Series) -> bool:
     return features["velocity_10min"] > 3
 
+
 rules = [rule_velocity]
+
 
 @app.post("/score")
 def score_transaction(txn: dict):
     # 1) Feature extraction
     features = pd.DataFrame([txn]).iloc[0]
     features["velocity_10min"] = compute_velocity(txn)
-    features["amount_bin"]     = compute_amount_bin(txn["transaction_amount"])
+    features["amount_bin"] = compute_amount_bin(txn["transaction_amount"])
 
     # 2) Rules scoring
-    rule_flags   = [int(rule(features)) for rule in rules]
-    score_rules  = sum(rule_flags) / len(rules)
+    rule_flags = [int(rule(features)) for rule in rules]
+    score_rules = sum(rule_flags) / len(rules)
 
     # 3) ML scoring
-    df_single    = pd.DataFrame([txn])
-    score_ml     = model.predict_proba(df_single)[:, 1][0]
+    df_single = pd.DataFrame([txn])
+    score_ml = model.predict_proba(df_single)[:, 1][0]
 
     # 4) Combined risk score
-    risk_score   = 0.5 * score_rules + 0.5 * score_ml
+    risk_score = 0.5 * score_rules + 0.5 * score_ml
 
     # 5) Decision logic
     if risk_score >= 0.8:
@@ -70,9 +87,9 @@ def score_transaction(txn: dict):
 
     return {
         "risk_score": round(risk_score, 3),
-        "action":     action,
+        "action": action,
         "features": {
             "velocity_10min": features["velocity_10min"],
-            "amount_bin":     features["amount_bin"],
+            "amount_bin": features["amount_bin"],
         }
     }
